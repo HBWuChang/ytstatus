@@ -9,7 +9,9 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
@@ -27,6 +29,10 @@ def load_config() -> dict:
     for key in required:
         config[key] = str(config[key]).strip()
     config["ranking_limit"] = max(1, min(int(config.get("ranking_limit", 10)), 50))
+    config["expiration_field"] = str(
+        config.get("expiration_field", "Expiration time")
+    ).strip()
+    config["timezone"] = str(config.get("timezone", "Asia/Shanghai")).strip()
     return config
 
 
@@ -52,7 +58,7 @@ def request_page(config: dict, skip: int) -> list[dict]:
         "/api/issues",
         {
             "query": config["query"],
-            "fields": "id,idReadable,summary",
+            "fields": "id,idReadable,summary,customFields(name,value)",
             "$skip": skip,
             "$top": PAGE_SIZE,
         },
@@ -68,7 +74,34 @@ def get_incomplete_issues(config: dict) -> list[dict]:
         page = request_page(config, len(issues))
         issues.extend(page)
         if len(page) < PAGE_SIZE:
-            return issues
+            return sorted(issues, key=lambda issue: issue_expiration_sort_key(config, issue))
+
+
+def issue_expiration(config: dict, issue: dict) -> int | None:
+    field_name = config["expiration_field"].casefold()
+    for field in issue.get("customFields") or []:
+        if str(field.get("name") or "").casefold() != field_name:
+            continue
+        value = field.get("value")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def issue_expiration_sort_key(config: dict, issue: dict) -> tuple:
+    expiration = issue_expiration(config, issue)
+    issue_id = str(issue.get("idReadable") or issue.get("id") or "")
+    return (expiration is None, expiration or 0, issue_id)
+
+
+def format_issue_expiration(config: dict, issue: dict) -> str:
+    expiration = issue_expiration(config, issue)
+    if expiration is None:
+        return "无过期时间"
+    timezone = ZoneInfo(config["timezone"])
+    return datetime.fromtimestamp(expiration / 1000, timezone).strftime("%Y-%m-%d %H:%M")
 
 
 def get_monthly_ranking(config: dict) -> tuple[list[dict], int | None, int]:
@@ -171,10 +204,11 @@ def main() -> int:
                 f' | bash="{plugin_path}" param1=--open-all terminal=false'
             )
             for issue in issues:
+                expiration = format_issue_expiration(config, issue)
                 readable_id = safe_menu_text(issue.get("idReadable") or issue.get("id"))
                 summary = safe_menu_text(issue.get("summary") or "无标题")
                 print(
-                    f'{readable_id} · {summary}'
+                    f'{expiration} · {readable_id} · {summary}'
                     f' | href="{issue_url(config, issue)}"'
                 )
         else:

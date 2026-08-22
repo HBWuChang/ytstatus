@@ -2,6 +2,8 @@
 
 状态栏每分钟查询一次 YouTrack，显示符合 `config.json` 中搜索条件的 issue 数量和本人当月排名。点击展开后可逐条打开未完成 issue，也可一次打开全部；菜单下方同时展示月榜前若干名。
 
+未完成 issue 按 `Expiration time` 升序排列，并在编号前显示北京时间；未设置过期时间的 issue 排在最后。字段名和时区可通过 `config.json` 的 `expiration_field`、`timezone` 调整。
+
 ## 文件
 
 - `plugins/youtrack-count.1m.py`：SwiftBar 插件
