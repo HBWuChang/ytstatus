@@ -1,0 +1,4 @@
+interface:
+  display_name: "YouTrack 状态栏安装"
+  short_description: "安装并按岗位配置 YouTrack SwiftBar 状态栏"
+  default_prompt: "Use $ytstatus-setup to install and configure the company YouTrack status bar for me."

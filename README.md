@@ -17,3 +17,7 @@
 4. `report_id` 指定月榜报表，`ranking_limit` 控制展开菜单显示的人数（1–50）。
 
 脚本文件名中的 `.1m.` 表示每分钟自动刷新。点击菜单中的“立即刷新”可手动刷新。
+
+## 让 AI 协助安装
+
+安装 Skill 位于 `skills/ytstatus-setup/SKILL.md`。在 Codex 中可使用 `$ytstatus-setup`；其他 AI 可直接读取该文件，并按其中流程询问安装位置、协助创建 YouTrack Token、按岗位配置查询及完成 SwiftBar 验收。
