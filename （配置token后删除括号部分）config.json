@@ -3,5 +3,15 @@
   "token": "perm-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
   "query": "project: DE4 assignee: me State: Todo",
   "report_id": "174-145",
-  "ranking_limit": 10
+  "ranking_limit": 10,
+  "utui": {
+    "session_id": "",
+    "endpoint": "https://s.utui.cc/get_upload_url"
+  },
+  "adb_shot": {
+    "adb_path": "",
+    "screenshot_dir": "~/Downloads",
+    "notify": true,
+    "jpeg_quality": 85
+  }
 }
