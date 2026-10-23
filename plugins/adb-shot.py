@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """SwiftBar plugin: 截取当前 adb 设备屏幕，可保存到下载文件夹或上传后复制链接。
 
-菜单两项：
-  1. 截图到下载文件夹        -> --shot
-  2. 截图并上传 · 复制链接   -> --upload
+菜单四项：
+  1. 截图到下载文件夹          -> --shot
+  2. 截图并上传 · 复制链接     -> --upload
+  3. 上传剪贴板图片 · 复制链接 -> --upload-clip
+  4. scrcpy                   -> --scrcpy
+
+剪贴板上传：从系统剪贴板读出图片（PNGf/TIFF），用 sips 转 JPEG 后走同一套上传流程，
+不需要连接 adb 设备；临时文件上传结束即删除。
 
 上传流程对应抓包样例：
   66: POST https://s.utui.cc/get_upload_url  (Cookie: session_id=...)
@@ -21,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -41,6 +47,19 @@ ADB_TIMEOUT = 15
 HTTP_TIMEOUT = 30
 SIPS = "/usr/bin/sips"
 PBCOPY = "/usr/bin/pbcopy"
+SCRCPY = Path("/Users/cd022/Downloads/scrcpy-macos-aarch64-v4.1/scrcpy")
+
+CLIPBOARD_IMAGE_TYPES = (("«class PNGf»", "png"), ("«class TIFF»", "tiff"))
+READ_CLIPBOARD_SCRIPT = """
+on run argv
+\tset target to POSIX file (item 1 of argv)
+\tset payload to the clipboard as {type}
+\tset fileRef to open for access target with write permission
+\tset eof fileRef to 0
+\twrite payload to fileRef
+\tclose access fileRef
+end run
+"""
 
 TITLE_ICON = "sfimage=camera.viewfinder"
 SITE_URL = "https://s.utui.cc/"
@@ -255,6 +274,29 @@ def list_devices(adb: Path) -> tuple[list[dict], list[dict]]:
     return ready, others
 
 
+def convert_to_jpeg(source: Path, target: Path, quality: int) -> None:
+    converted = subprocess.run(
+        [
+            SIPS,
+            "-s",
+            "format",
+            "jpeg",
+            "-s",
+            "formatOptions",
+            str(quality),
+            str(source),
+            "--out",
+            str(target),
+        ],
+        check=False,
+        timeout=30,
+        capture_output=True,
+    )
+    if converted.returncode != 0 or not target.exists():
+        message = (converted.stderr or converted.stdout).decode("utf-8", "replace").strip()
+        raise PluginError(f"图片转 JPEG 失败: {message or converted.returncode}")
+
+
 def capture_png(adb: Path, serial: str) -> bytes:
     result = subprocess.run(
         [str(adb), "-s", serial, "exec-out", "screencap", "-p"],
@@ -302,31 +344,61 @@ def save_screenshot(adb: Path, serial: str, options: dict) -> Path:
         png_file.write(png_bytes)
         png_path = Path(png_file.name)
     try:
-        converted = subprocess.run(
+        convert_to_jpeg(png_path, target, options["jpeg_quality"])
+    finally:
+        png_path.unlink(missing_ok=True)
+    return target
+
+
+def clipboard_image_type() -> tuple[str, str] | None:
+    """返回剪贴板中的图片类型（AppleScript 类型字面量, 文件后缀）。"""
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", "clipboard info"],
+            check=False,
+            timeout=10,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise PluginError(f"读取剪贴板类型失败: {error}") from error
+
+    info = result.stdout.decode("utf-8", "replace")
+    for type_literal, suffix in CLIPBOARD_IMAGE_TYPES:
+        if type_literal in info:
+            return type_literal, suffix
+    return None
+
+
+def save_clipboard_image(options: dict) -> tuple[Path, Path]:
+    """把剪贴板里的图片转成 JPEG，返回 (jpeg 路径, 临时目录)。"""
+    found = clipboard_image_type()
+    if found is None:
+        raise PluginError("剪贴板里没有图片")
+    type_literal, suffix = found
+
+    workdir = Path(tempfile.mkdtemp(prefix="adb-shot-clip-"))
+    raw_path = workdir / f"clipboard.{suffix}"
+    target = workdir / "clipboard.jpg"
+    try:
+        result = subprocess.run(
             [
-                SIPS,
-                "-s",
-                "format",
-                "jpeg",
-                "-s",
-                "formatOptions",
-                str(options["jpeg_quality"]),
-                str(png_path),
-                "--out",
-                str(target),
+                "/usr/bin/osascript",
+                "-e",
+                READ_CLIPBOARD_SCRIPT.replace("{type}", type_literal),
+                str(raw_path),
             ],
             check=False,
             timeout=30,
             capture_output=True,
         )
-        if converted.returncode != 0 or not target.exists():
-            message = (converted.stderr or converted.stdout).decode(
-                "utf-8", "replace"
-            ).strip()
-            raise PluginError(f"PNG 转 JPEG 失败: {message or converted.returncode}")
-    finally:
-        png_path.unlink(missing_ok=True)
-    return target
+        if result.returncode != 0 or not raw_path.exists() or not raw_path.stat().st_size:
+            message = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+            raise PluginError(f"读取剪贴板图片失败: {message or result.returncode}")
+        convert_to_jpeg(raw_path, target, options["jpeg_quality"])
+    except BaseException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+    return target, workdir
 
 
 # --------------------------------------------------------------------------- #
@@ -479,6 +551,52 @@ def prepare_screenshot(config: dict, serial: str | None) -> tuple[Path, dict]:
     return save_screenshot(adb, device["serial"], options), options
 
 
+def do_scrcpy(config: dict, serial: str | None) -> int:
+    try:
+        if not SCRCPY.is_file() or not os.access(SCRCPY, os.X_OK):
+            raise PluginError(f"找不到可执行的 scrcpy: {SCRCPY}")
+        adb = resolve_adb(config)
+        if adb is None:
+            raise PluginError("找不到 adb，请在 config.json 的 adb_shot.adb_path 指定")
+        device = resolve_device(adb, serial)
+        environment = os.environ.copy()
+        environment["ADB"] = str(adb)
+        with tempfile.TemporaryFile() as log:
+            process = subprocess.Popen(
+                [str(SCRCPY), "--serial", device["serial"]],
+                cwd=str(SCRCPY.parent),
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
+            try:
+                returncode = process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                if returncode != 0:
+                    log.seek(0)
+                    output = log.read()
+                    if output.strip():
+                        detail = summarize(output, 400)
+                    elif returncode < 0:
+                        detail = f"进程被信号 {signal.Signals(-returncode).name} 终止"
+                        if returncode == -signal.SIGKILL:
+                            detail += "，请检查 macOS 崩溃报告中的代码签名错误"
+                    else:
+                        detail = f"退出码 {returncode}，无输出"
+                    raise PluginError(f"scrcpy 启动失败: {detail}")
+        save_state(action="scrcpy", ok=True, detail=f"scrcpy 已启动 · {device_label(device)}")
+        return 0
+    except Exception as error:  # noqa: BLE001 - 将启动错误显示在菜单中
+        save_state(action="scrcpy", ok=False, detail=str(error))
+        if shot_options(config)["notify"]:
+            notify("scrcpy 启动失败", str(error))
+        return 1
+
+
 def do_shot(config: dict, serial: str | None) -> int:
     acquire_lock()
     try:
@@ -536,6 +654,43 @@ def do_upload(config: dict, serial: str | None) -> int:
         release_lock()
 
 
+def do_upload_clip(config: dict) -> int:
+    acquire_lock()
+    workdir: Path | None = None
+    try:
+        image_path, workdir = save_clipboard_image(shot_options(config))
+        view_url = upload_image(image_path, config)
+        copy_to_clipboard(view_url)
+        save_state(
+            action="upload-clip",
+            ok=True,
+            detail="剪贴板图片上传成功，链接已复制",
+            url=view_url,
+        )
+        if shot_options(config)["notify"]:
+            notify("剪贴板图片已上传", f"链接已复制到剪贴板\n{view_url}")
+        return 0
+    except AuthError as error:
+        save_state(action="upload-clip", ok=False, detail=str(error), auth_error=True)
+        if shot_options(config)["notify"]:
+            notify("剪贴板上传失败", str(error))
+        return 1
+    except PluginError as error:
+        save_state(action="upload-clip", ok=False, detail=str(error))
+        if shot_options(config)["notify"]:
+            notify("剪贴板上传失败", str(error))
+        return 1
+    except Exception as error:  # noqa: BLE001
+        save_state(
+            action="upload-clip", ok=False, detail=f"{type(error).__name__}: {error}"
+        )
+        return 1
+    finally:
+        if workdir is not None:
+            shutil.rmtree(workdir, ignore_errors=True)
+        release_lock()
+
+
 # --------------------------------------------------------------------------- #
 # 菜单
 # --------------------------------------------------------------------------- #
@@ -564,6 +719,10 @@ def print_state_line(state: dict) -> None:
     if state.get("ok"):
         if state.get("action") == "upload":
             print(f"最近一次: {stamp} 上传成功 · 链接已复制 | color=#8E8E93")
+        elif state.get("action") == "upload-clip":
+            print(f"最近一次: {stamp} 剪贴板图片上传成功 · 链接已复制 | color=#8E8E93")
+        elif state.get("action") == "scrcpy":
+            print(f"最近一次: {stamp} {detail} | color=#8E8E93")
         else:
             name = Path(state.get("file") or "").name
             file_url = urllib.parse.quote(str(state.get("file") or ""), safe="/:")
@@ -600,6 +759,7 @@ def render_menu() -> int:
 
     options = shot_options(config)
     state = load_state()
+    session_id = upload_options(config)["session_id"]
     adb = resolve_adb(config)
 
     print(f"📱 | {TITLE_ICON}")
@@ -609,6 +769,7 @@ def render_menu() -> int:
         print("找不到 adb，可在 config.json 指定 adb_path | color=red")
         print("截图到下载文件夹 | color=#8E8E93")
         print("截图并上传 · 复制链接 | color=#8E8E93")
+        print("scrcpy | color=#8E8E93")
     else:
         try:
             ready, others = list_devices(adb)
@@ -619,14 +780,17 @@ def render_menu() -> int:
         if error is not None:
             print(f"adb 异常: {safe_menu_text(error)} | color=red")
             print("截图到下载文件夹 | color=#8E8E93")
+            print("scrcpy | color=#8E8E93")
         elif not ready:
             print("未连接设备 | color=#8E8E93")
             print("截图到下载文件夹 | color=#8E8E93")
             print("截图并上传 · 复制链接 | color=#8E8E93")
+            print("scrcpy | color=#8E8E93")
         elif len(ready) == 1:
             device = ready[0]
             print(f"截图到下载文件夹 | {plugin_command('--shot')}")
             print(f"截图并上传 · 复制链接 | {plugin_command('--upload')}")
+            print(f"scrcpy | {plugin_command('--scrcpy', device['serial'])}")
             print(f"当前设备: {device_label(device)} | color=#8E8E93")
         else:
             for device in ready:
@@ -635,11 +799,17 @@ def render_menu() -> int:
                 print(
                     f"--截图并上传 · 复制链接 | {plugin_command('--upload', device['serial'])}"
                 )
+                print(f"--scrcpy | {plugin_command('--scrcpy', device['serial'])}")
 
         for device in others:
             print(f"{device_label(device)} · {device['state']} | color=orange")
 
-    if not upload_options(config)["session_id"]:
+    if session_id:
+        print(f"上传剪贴板图片 · 复制链接 | {plugin_command('--upload-clip')}")
+    else:
+        print("上传剪贴板图片 · 复制链接 | color=#8E8E93")
+
+    if not session_id:
         print("未配置 utui.session_id | color=#8E8E93")
 
     print_state_line(state)
@@ -657,14 +827,18 @@ def main() -> int:
     action = arguments[0] if arguments else ""
     serial = arguments[1] if len(arguments) > 1 else None
 
-    if action in ("--shot", "--upload"):
+    if action in ("--shot", "--upload", "--upload-clip", "--scrcpy"):
         try:
             config = load_config()
         except PluginError as error:
             save_state(action=action.strip("-"), ok=False, detail=str(error))
             return 1
+        if action == "--upload-clip":
+            return do_upload_clip(config)
         if action == "--shot":
             return do_shot(config, serial)
+        if action == "--scrcpy":
+            return do_scrcpy(config, serial)
         return do_upload(config, serial)
 
     return render_menu()
