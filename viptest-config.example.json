@@ -1,0 +1,8 @@
+{
+  "username": "evanchang@88vip.site",
+  "password": "",
+  "target_email": "evanchang@88vip.site",
+  "totp": "粘贴单账号 otpauth-migration://offline?data=...、otpauth://totp/... 或 Base32 密钥",
+  "basic_username": "viptest账号",
+  "basic_password": "viptest密码"
+}
